@@ -23,10 +23,65 @@ struct {
   struct run *freelist;
 } kmem;
 
+struct{
+  struct spinlock lock;
+  int cnt[PGROUNDUP(PHYSTOP)/PGSIZE];
+}refc;
+
+void refcinit(){
+  initlock(&refc.lock, "refc");
+  for(int i = 0; i < PGROUNDUP(PHYSTOP)/PGSIZE; i++){
+    refc.cnt[i] = 1;
+  }
+}
+
+void refcincr(void *pa){
+  acquire(&refc.lock);
+  refc.cnt[PA2IDX(pa)]++;
+  release(&refc.lock);
+}
+
+void refcdecr(void *pa){
+  acquire(&refc.lock);
+  refc.cnt[PA2IDX(pa)]--;
+  release(&refc.lock);
+}
+
+int cowalloc(pagetable_t pagetable, uint64 va){
+  pte_t *pte;
+  uint64 pa;
+  char* mem;
+  uint flags;
+  if((pte = walk(pagetable, va, 0)) == 0){
+    return -1;
+  }
+  if((pa = PTE2PA(*pte)) == 0){
+    return -1;
+  }
+  if((*pte & PTE_V) == 0){
+    return -1;
+  }
+  if(*pte & PTE_W){
+    return 0;
+  }
+  if((*pte & PTE_C) == 0){
+    return -1;
+  }
+  if((mem = kalloc()) == 0){
+    return -1;
+  }
+  flags = (PTE_FLAGS(*pte) & ~PTE_C) | PTE_W;
+  memmove(mem, (char*)pa, PGSIZE);
+  *pte = PA2PTE(mem) | flags;
+  kfree((void*)pa);
+  return 0;
+}
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  refcinit();
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -50,7 +105,10 @@ kfree(void *pa)
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
-
+  refcdecr(pa);
+  if(refc.cnt[PA2IDX(pa)] > 0){
+    return;
+  }
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
 
@@ -78,5 +136,7 @@ kalloc(void)
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
+
+  refcincr(r);
   return (void*)r;
 }
